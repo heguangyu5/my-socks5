@@ -17,7 +17,7 @@
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 #define FPRINTF_DEBUG(...) fprintf(logFile, __VA_ARGS__)
 #else
