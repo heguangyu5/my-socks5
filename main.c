@@ -829,6 +829,7 @@ void start(int sfd)
         if (ready == 0 || loopCount == 1000) {
             loopCount = 0;
             clearTimeoutConns();
+            fflush(logFile);
         }
         loopCount++;
     }
@@ -937,6 +938,7 @@ int main(int argc, char **argv)
     fprintf(logFile, "start, port = %d, pid = %d\n", port, getpid());
     fprintf(logFile, "username: %s\n", username);
     fprintf(logFile, "password: %s\n", password);
+    fflush(logFile);
     start(sfd);
 
     return 0;
