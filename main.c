@@ -285,6 +285,8 @@ void delayCloseConn(struct conn *conn)
 */
 void cmdReplyError(struct conn *conn, int8_t err)
 {
+    FPRINTF_DEBUG("cmd reply error: %d\n", err);
+
     conn->buf->buf[1] = err;
     conn->buf->expectedBytes = conn->buf->bufUsed;
     conn->buf->bufp = conn->buf->buf;
@@ -588,6 +590,7 @@ void doAuth(struct conn *conn)
     } else {
         buf[1] = AUTH_METHOD_USER_PASS_FAILED;
         nextCallback = delayCloseConn;
+        FPRINTF_DEBUG("auth failed\n");
     }
 
     conn->buf->expectedBytes = 2;
@@ -654,6 +657,12 @@ void selectAuthMethod(struct conn *conn)
             break;
         }
     }
+
+#ifdef DEBUG
+    if (method == 0xFF) {
+        FPRINTF_DEBUG("no acceptable methods\n");
+    }
+#endif
 
     buf[1] = method;
     conn->buf->expectedBytes = 2;
