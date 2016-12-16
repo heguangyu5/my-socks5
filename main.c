@@ -17,15 +17,14 @@
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 
-// #define DEBUG
+#define FPRINTF(...) fprintf(logFile, __VA_ARGS__); fflush(logFile)
 #ifdef DEBUG
-#define FPRINTF_DEBUG(...) fprintf(logFile, __VA_ARGS__)
+#define FPRINTF_DEBUG(...) fprintf(logFile, __VA_ARGS__); fflush(logFile)
 #else
 #define FPRINTF_DEBUG(...)
 #endif
 
 #define MAX_CONNS 500
-#define CONN_TIMEOUT 60
 #define CONN_BUF_LEN 4096
 struct connBuf {
     uint16_t    expectedBytes;
@@ -35,7 +34,6 @@ struct connBuf {
 };
 struct conn {
     int             fd;
-    time_t          lastActive;
     uint32_t        expectedEvents;
     void            (*callback)(struct conn *);
     void            (*nextCallback)(struct conn *);
@@ -67,7 +65,7 @@ struct conn {
 // GLOBAL VARS
 struct conn clientConnList[MAX_CONNS];
 struct conn remoteConnList[MAX_CONNS];
-struct connBuf bufPool[MAX_CONNS * 2];
+struct connBuf bufPool[MAX_CONNS];
 int         epfd;
 FILE        *logFile;
 char        *username;
@@ -91,10 +89,10 @@ void help()
 void signal_handler(int signo)
 {
     if (signo == SIGINT) {
-        fprintf(logFile, "caught SIGINT, exit\n");
+        FPRINTF("caught SIGINT, exit\n");
     }
     if (signo == SIGTERM) {
-        fprintf(logFile, "caught SIGTERM, exit\n");
+        FPRINTF("caught SIGTERM, exit\n");
     }
     exit(0);
 }
@@ -106,47 +104,18 @@ void initConns()
         clientConnList[i].fd  = -1;
         clientConnList[i].buf = bufPool + i;
         remoteConnList[i].fd  = -1;
-        remoteConnList[i].buf = bufPool + MAX_CONNS + i;
+        remoteConnList[i].buf = bufPool + i;
     }
 }
 
 void closeConn(struct conn *conn)
 {
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL) == -1) {
-        fprintf(logFile, "epoll_ctl del fd error: %s\n", strerror(errno));
+        FPRINTF("epoll_ctl del fd error: %s\n", strerror(errno));
         exit(1);
     }
     close(conn->fd);
     conn->fd = -1;
-}
-
-void clearTimeoutConns()
-{
-    FPRINTF_DEBUG("clear timed out conns\n");
-
-    time_t now = time(NULL);
-    int count = 0;
-    int i;
-    for (i = 0; i < MAX_CONNS; i++) {
-        if (clientConnList[i].fd > -1 && now - clientConnList[i].lastActive > CONN_TIMEOUT) {
-            if (clientConnList[i].assocConn) {
-                closeConn(clientConnList[i].assocConn);
-            }
-            closeConn(clientConnList + i);
-            count++;
-        }
-        if (remoteConnList[i].fd > -1 && now - remoteConnList[i].lastActive > CONN_TIMEOUT) {
-            if (remoteConnList[i].assocConn) {
-                closeConn(remoteConnList[i].assocConn);
-            }
-            closeConn(remoteConnList + i);
-            count++;
-        }
-    }
-
-    if (count > 0) {
-        fprintf(logFile, "found %d connections timed out, closed.\n", count);
-    }
 }
 
 struct conn *getAFreeClientConn()
@@ -191,7 +160,7 @@ void readN(struct conn *conn)
             return conn->nextCallback(conn);
         }
         if (n == 0) {
-            fprintf(logFile, "conn closed by peer\n");
+            FPRINTF_DEBUG("conn closed by peer\n");
             goto closeConn;
         }
         // n < 0
@@ -211,7 +180,7 @@ void readN(struct conn *conn)
     }
 
     if (n == 0) {
-        fprintf(logFile, "conn closed by peer\n");
+        FPRINTF_DEBUG("conn closed by peer\n");
         goto closeConn;
     }
 
@@ -220,7 +189,7 @@ void readN(struct conn *conn)
         return;
     }
 error:
-    fprintf(logFile, "readN error: %s\n", strerror(errno));
+    FPRINTF("readN error: %s\n", strerror(errno));
 closeConn:
     if (conn->assocConn) {
         closeConn(conn->assocConn);
@@ -248,7 +217,7 @@ void writeN(struct conn *conn)
                 ev.events   = EPOLLIN;
                 ev.data.ptr = conn;
                 if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev) == -1) {
-                    fprintf(logFile, "epoll_ctl mod error: %s\n", strerror(errno));
+                    FPRINTF("epoll_ctl mod error: %s\n", strerror(errno));
                     exit(1);
                 }
             }
@@ -265,7 +234,7 @@ void writeN(struct conn *conn)
     if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
         goto epollout;
     }
-    fprintf(logFile, "writeN error: %s\n", strerror(errno));
+    FPRINTF("writeN error: %s\n", strerror(errno));
 
     if (conn->assocConn) {
         closeConn(conn->assocConn);
@@ -285,7 +254,7 @@ epollout:
     ev.events   = EPOLLOUT;
     ev.data.ptr = conn;
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev) == -1) {
-        fprintf(logFile, "epoll_ctl mod error: %s\n", strerror(errno));
+        FPRINTF("epoll_ctl mod error: %s\n", strerror(errno));
         exit(1);
     }
 }
@@ -294,7 +263,6 @@ void delayCloseConn(struct conn *conn)
 {
     FPRINTF_DEBUG("delay close conn\n");
 
-    conn->lastActive   = time(NULL);
     conn->callback     = readN;
     conn->nextCallback = NULL;
     resetConnBuf(conn->buf);
@@ -320,7 +288,6 @@ void cmdReplyError(struct conn *conn, int8_t err)
     conn->buf->buf[1] = err;
     conn->buf->expectedBytes = conn->buf->bufUsed;
     conn->buf->bufp = conn->buf->buf;
-    conn->lastActive   = time(NULL);
     conn->callback     = NULL;
     conn->nextCallback = delayCloseConn;
     writeN(conn);
@@ -336,13 +303,6 @@ void processCommandUdpAssociate(struct conn *conn)
     cmdReplyError(conn, CMD_REPLY_NOT_SUPPORTED);
 }
 
-void exchangeBuf(struct conn *clientConn, struct conn *remoteConn)
-{
-    struct connBuf *buf = clientConn->buf;
-    clientConn->buf = remoteConn->buf;
-    remoteConn->buf = buf;
-}
-
 void proxyToRemoteTargetDone(struct conn *remoteConn);
 void proxyToRemoteTarget(struct conn *clientConn);
 void proxyToClientDone(struct conn *clientConn);
@@ -352,15 +312,13 @@ void proxyToRemoteTargetDone(struct conn *remoteConn)
 {
     FPRINTF_DEBUG("proxy to remote target done\n");
 
-    struct conn *clientConn = remoteConn->assocConn;
-    clientConn->blocked = 0;
-    exchangeBuf(clientConn, remoteConn);
+    // client
+    remoteConn->assocConn->blocked    = 0;
+    // remote
     remoteConn->callback     = readN;
     remoteConn->nextCallback = proxyToClient;
-
-    clientConn->lastActive = time(NULL);
-    resetConnBuf(clientConn->buf);
-    clientConn->buf->expectedBytes = CONN_BUF_LEN;
+    resetConnBuf(remoteConn->buf);
+    remoteConn->buf->expectedBytes = CONN_BUF_LEN;
 }
 
 void proxyToRemoteTarget(struct conn *clientConn)
@@ -373,10 +331,8 @@ void proxyToRemoteTarget(struct conn *clientConn)
 
     clientConn->blocked = 1; // ignore clientConn events
     struct conn *remoteConn = clientConn->assocConn;
-    exchangeBuf(clientConn, remoteConn);
     remoteConn->buf->expectedBytes = remoteConn->buf->bufUsed;
     remoteConn->buf->bufp = remoteConn->buf->buf;
-    remoteConn->lastActive   = time(NULL);
     remoteConn->callback     = NULL;
     remoteConn->nextCallback = proxyToRemoteTargetDone;
     writeN(remoteConn);
@@ -386,15 +342,13 @@ void proxyToClientDone(struct conn *clientConn)
 {
     FPRINTF_DEBUG("proxy to client done\n");
 
-    struct conn *remoteConn = clientConn->assocConn;
-    remoteConn->blocked = 0;
-    exchangeBuf(clientConn, remoteConn);
+    // remote
+    clientConn->assocConn->blocked    = 0;
+    // client
     clientConn->callback     = readN;
     clientConn->nextCallback = proxyToRemoteTarget;
-
-    remoteConn->lastActive = time(NULL);
-    resetConnBuf(remoteConn->buf);
-    remoteConn->buf->expectedBytes = CONN_BUF_LEN;
+    resetConnBuf(clientConn->buf);
+    clientConn->buf->expectedBytes = CONN_BUF_LEN;
 }
 
 void proxyToClient(struct conn *remoteConn)
@@ -407,24 +361,34 @@ void proxyToClient(struct conn *remoteConn)
 
     remoteConn->blocked = 1; // ignore remoteConn events
     struct conn *clientConn = remoteConn->assocConn;
-    exchangeBuf(clientConn, remoteConn);
     clientConn->buf->expectedBytes = clientConn->buf->bufUsed;
     clientConn->buf->bufp = clientConn->buf->buf;
-    clientConn->lastActive   = time(NULL);
     clientConn->callback     = NULL;
     clientConn->nextCallback = proxyToClientDone;
     writeN(clientConn);
 }
 
-void startProxyToRemote(struct conn *clientConn)
+void startProxy(struct conn *clientConn)
 {
-    FPRINTF_DEBUG("start proxy to remote\n");
+    FPRINTF_DEBUG("start proxy\n");
 
-    clientConn->lastActive   = time(NULL);
     clientConn->callback     = readN;
     clientConn->nextCallback = proxyToRemoteTarget;
     resetConnBuf(clientConn->buf);
     clientConn->buf->expectedBytes = CONN_BUF_LEN;
+
+    struct conn *remoteConn = clientConn->assocConn;
+    remoteConn->expectedEvents = EPOLLIN;
+    remoteConn->callback       = readN;
+    remoteConn->nextCallback   = proxyToClient;
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.ptr = remoteConn;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, remoteConn->fd, &ev) == -1) {
+        FPRINTF("epoll_ctl add error: %s\n", strerror(errno));
+        exit(1);
+    }
 }
 
 void confirmConnectedToRemoteTarget(struct conn *remoteConn)
@@ -435,35 +399,28 @@ void confirmConnectedToRemoteTarget(struct conn *remoteConn)
     socklen_t optlen = sizeof(optval);
     int ret = getsockopt(remoteConn->fd, SOL_SOCKET, SO_ERROR, &optval, &optlen);
     if (ret == -1) {
-        fprintf(logFile, "getsockopt error: %s\n", strerror(errno));
+        FPRINTF("getsockopt error: %s\n", strerror(errno));
         goto error;
     }
     if (optval != 0) {
-        fprintf(logFile, "connect to remote target error: %s\n", strerror(errno));
+        FPRINTF("connect to remote target error: %s\n", strerror(errno));
         goto error;
     }
-
     // optval = 0, connect success
-    remoteConn->lastActive     = time(NULL);
-    remoteConn->expectedEvents = EPOLLIN;
-    remoteConn->callback       = readN;
-    remoteConn->nextCallback   = proxyToClient;
-    resetConnBuf(remoteConn->buf);
-    remoteConn->buf->expectedBytes = CONN_BUF_LEN;
-
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = remoteConn;
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, remoteConn->fd, &ev) == -1) {
-        fprintf(logFile, "epoll_ctl mod fd error: %s\n", strerror(errno));
-        exit(1);
-    }
-
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     if (getsockname(remoteConn->fd, (struct sockaddr *)&addr, &addrlen) == -1) {
-        fprintf(logFile, "getsockname error: %s\n", strerror(errno));
+        FPRINTF("getsockname error: %s\n", strerror(errno));
         goto error;
+    }
+    optval = 1;
+    if (setsockopt(remoteConn->fd, SOL_SOCKET, SO_KEEPALIVE, &optval, optlen) == -1) {
+        FPRINTF("setsockopt keepalive error: %s\n", strerror(errno));
+        goto error;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, remoteConn->fd, NULL) == -1) {
+        FPRINTF("epoll_ctl del fd error: %s\n", strerror(errno));
+        exit(1);
     }
 
     struct conn *clientConn = remoteConn->assocConn;
@@ -474,13 +431,13 @@ void confirmConnectedToRemoteTarget(struct conn *remoteConn)
 
     clientConn->buf->expectedBytes = 10; // 4 + 4 + 2
     clientConn->buf->bufp = clientConn->buf->buf;
-    clientConn->lastActive   = time(NULL);
     clientConn->callback     = NULL;
-    clientConn->nextCallback = startProxyToRemote;
+    clientConn->nextCallback = startProxy;
     writeN(clientConn);
     return;
 
 error:
+    closeConn(remoteConn);
     cmdReplyError(remoteConn->assocConn, CMD_REPLY_GENERRAL_SOCKS_ERROR);
 }
 
@@ -503,25 +460,24 @@ void processCommandConnect(struct conn *conn)
 
     int remotefd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (remotefd == -1) {
-        fprintf(logFile, "create remote socket error: %s\n", strerror(errno));
+        FPRINTF("create remote socket error: %s\n", strerror(errno));
         cmdReplyError(conn, CMD_REPLY_GENERRAL_SOCKS_ERROR);
         return;
     }
 
     if (connect(remotefd, (struct sockaddr *)&addr, sizeof(addr)) != -1) {
-        fprintf(logFile, "!!!connect to remote target immediately!!!\n");
+        FPRINTF("!!!connect to remote target immediately!!!\n");
         exit(1);
     }
 
     if (errno != EINPROGRESS) {
-        fprintf(logFile, "connect error: %s\n", strerror(errno));
+        FPRINTF("connect error: %s\n", strerror(errno));
         cmdReplyError(conn, CMD_REPLY_GENERRAL_SOCKS_ERROR);
         return;
     }
 
     struct conn *remoteConn = getAFreeRemoteConn();
     remoteConn->fd             = remotefd;
-    remoteConn->lastActive     = time(NULL);
     remoteConn->expectedEvents = EPOLLOUT;
     remoteConn->callback       = confirmConnectedToRemoteTarget;
 
@@ -531,7 +487,7 @@ void processCommandConnect(struct conn *conn)
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, remotefd, &ev) == -1) {
         remoteConn->fd = -1;
         close(remotefd);
-        fprintf(logFile, "epoll_ctl add error: %s\n", strerror(errno));
+        FPRINTF("epoll_ctl add error: %s\n", strerror(errno));
         cmdReplyError(conn, CMD_REPLY_GENERRAL_SOCKS_ERROR);
         return;
     }
@@ -592,7 +548,7 @@ void processCommandCalcLen(struct conn *conn)
     return;
 
 badFormat:
-    fprintf(logFile, "request format wrong\n");
+    FPRINTF("request format wrong\n");
     closeConn(conn);
 }
 
@@ -600,7 +556,6 @@ void startProcessCommand(struct conn *conn)
 {
     FPRINTF_DEBUG("start process command\n");
 
-    conn->lastActive   = time(NULL);
     conn->callback     = readN;
     conn->nextCallback = processCommandCalcLen;
     resetConnBuf(conn->buf);
@@ -637,7 +592,6 @@ void doAuth(struct conn *conn)
 
     conn->buf->expectedBytes = 2;
     conn->buf->bufp = buf;
-    conn->lastActive   = time(NULL);
     conn->callback     = NULL;
     conn->nextCallback = nextCallback;
     writeN(conn);
@@ -651,7 +605,7 @@ void authPasswordCalcLen(struct conn *conn)
     uint8_t plen = buf[2 + buf[1]];
 
     if (plen == 0) {
-        fprintf(logFile, "username/password request format wrong\n");
+        FPRINTF("username/password request format wrong\n");
         closeConn(conn);
         return;
     }
@@ -667,7 +621,7 @@ void authUsernameCalcLen(struct conn *conn)
     uint8_t *buf = (uint8_t *)conn->buf->buf;
 
     if (buf[0] != AUTH_METHOD_USER_PASS_VER || buf[1] == 0) {
-        fprintf(logFile, "username/password request format wrong\n");
+        FPRINTF("username/password request format wrong\n");
         closeConn(conn);
         return;
     }
@@ -680,7 +634,6 @@ void startAuth(struct conn *conn)
 {
     FPRINTF_DEBUG("start auth\n");
 
-    conn->lastActive   = time(NULL);
     conn->callback     = readN;
     conn->nextCallback = authUsernameCalcLen;
     resetConnBuf(conn->buf);
@@ -705,7 +658,6 @@ void selectAuthMethod(struct conn *conn)
     buf[1] = method;
     conn->buf->expectedBytes = 2;
     conn->buf->bufp = buf;
-    conn->lastActive   = time(NULL);
     conn->callback     = NULL;
     conn->nextCallback = method == 0xFF ? delayCloseConn : startAuth;
     writeN(conn);
@@ -724,7 +676,7 @@ void selectAuthMethodCalcLen(struct conn *conn)
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
     if (buf[0] != SOCKS5_VER || buf[1] == 0) {
-        fprintf(logFile, "version identifier/method selection message format wrong\n");
+        FPRINTF("version identifier/method selection message format wrong\n");
         closeConn(conn);
         return;
     }
@@ -742,7 +694,7 @@ void acceptClient(struct conn *listeningConn)
 
     int cfd = accept4(listeningConn->fd, &addr, &addrlen, SOCK_NONBLOCK);
     if (cfd == -1) {
-        fprintf(logFile, "accept4 error: %s", strerror(errno));
+        FPRINTF("accept4 error: %s", strerror(errno));
         return;
     }
 
@@ -755,12 +707,18 @@ void acceptClient(struct conn *listeningConn)
     struct conn *conn = getAFreeClientConn();
     if (conn == NULL) {
         close(cfd);
-        fprintf(logFile, "too many conns, drop client\n");
+        FPRINTF("too many conns, drop client\n");
+        return;
+    }
+
+    int optval = 1;
+    if (setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) == -1) {
+        close(cfd);
+        FPRINTF("setsockopt keepalive error: %s\n", strerror(errno));
         return;
     }
 
     conn->fd             = cfd;
-    conn->lastActive     = time(NULL);
     conn->expectedEvents = EPOLLIN;
     conn->callback       = readN;
     conn->nextCallback   = selectAuthMethodCalcLen;
@@ -774,7 +732,7 @@ void acceptClient(struct conn *listeningConn)
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
         conn->fd = -1;
         close(cfd);
-        fprintf(logFile, "epoll_ctl add error: %s\n", strerror(errno));
+        FPRINTF("epoll_ctl add error: %s\n", strerror(errno));
     }
 }
 
@@ -792,14 +750,13 @@ void start(int sfd)
     ev.events   = EPOLLIN;
     ev.data.ptr = &listeningConn;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev) == -1) {
-        fprintf(logFile, "epoll_ctl add error: %s\n", strerror(errno));
+        FPRINTF("epoll_ctl add error: %s\n", strerror(errno));
         exit(1);
     }
 
     struct epoll_event evList[1 + MAX_CONNS * 2];
     int ready;
     int i;
-    int loopCount = 0;
     struct conn *conn;
     while (1) {
         ready = epoll_wait(epfd, evList, MAX_CONNS * 2 + 1, 60000);
@@ -807,7 +764,7 @@ void start(int sfd)
             if (errno == EINTR) {
                 continue;
             }
-            fprintf(logFile, "epoll_wait error: %s\n", strerror(errno));
+            FPRINTF("epoll_wait error: %s\n", strerror(errno));
             exit(1);
         }
         FPRINTF_DEBUG("epoll_wait return %d\n", ready);
@@ -818,7 +775,7 @@ void start(int sfd)
                     conn->callback(conn);
                 }
             } else if (conn->fd == sfd) {
-                fprintf(logFile, "listening socket: unexpected events\n");
+                FPRINTF("listening socket: unexpected events\n");
             } else {
                 if (conn->assocConn) {
                     closeConn(conn->assocConn);
@@ -826,12 +783,6 @@ void start(int sfd)
                 closeConn(conn);
             }
         }
-        if (ready == 0 || loopCount == 1000) {
-            loopCount = 0;
-            clearTimeoutConns();
-            fflush(logFile);
-        }
-        loopCount++;
     }
 }
 
@@ -935,10 +886,9 @@ int main(int argc, char **argv)
         logFile = stdout;
     }
     // start
-    fprintf(logFile, "start, port = %d, pid = %d\n", port, getpid());
-    fprintf(logFile, "username: %s\n", username);
-    fprintf(logFile, "password: %s\n", password);
-    fflush(logFile);
+    FPRINTF("start, port = %d, pid = %d\n", port, getpid());
+    FPRINTF("username: %s\n", username);
+    FPRINTF("password: %s\n", password);
     start(sfd);
 
     return 0;
