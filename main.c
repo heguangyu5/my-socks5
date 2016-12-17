@@ -24,6 +24,9 @@
 #define FPRINTF_DEBUG(...)
 #endif
 
+#define HIGHLIGHT_START "\033[32;49;1m"
+#define HIGHLIGHT_END   "\033[39;49;0m"
+
 #define MAX_CONNS 500
 #define CONN_BUF_LEN 4096
 struct connBuf {
@@ -40,6 +43,10 @@ struct conn {
     struct conn     *assocConn;
     struct connBuf  *buf;
     uint8_t         blocked;
+#ifdef DEBUG
+    char            ip[INET_ADDRSTRLEN];
+    uint16_t        port;
+#endif
 };
 
 #define CMD_CONNECT         1
@@ -104,12 +111,15 @@ void initConns()
         clientConnList[i].fd  = -1;
         clientConnList[i].buf = bufPool + i;
         remoteConnList[i].fd  = -1;
-        remoteConnList[i].buf = bufPool + i;
     }
 }
 
 void closeConn(struct conn *conn)
 {
+    if (conn->fd == -1) {
+        return;
+    }
+
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, NULL) == -1) {
         FPRINTF("epoll_ctl del fd error: %s\n", strerror(errno));
         exit(1);
@@ -160,7 +170,7 @@ void readN(struct conn *conn)
             return conn->nextCallback(conn);
         }
         if (n == 0) {
-            FPRINTF_DEBUG("conn closed by peer\n");
+            FPRINTF_DEBUG("conn closed\n");
             goto closeConn;
         }
         // n < 0
@@ -180,7 +190,7 @@ void readN(struct conn *conn)
     }
 
     if (n == 0) {
-        FPRINTF_DEBUG("conn closed by peer\n");
+        FPRINTF_DEBUG("conn closed\n");
         goto closeConn;
     }
 
@@ -205,12 +215,15 @@ void writeN(struct conn *conn)
 {
     struct connBuf *connBuf = conn->buf;
 
+    FPRINTF_DEBUG("want write %d bytes\n", connBuf->expectedBytes);
     int n = write(conn->fd, connBuf->bufp, connBuf->expectedBytes);
+    FPRINTF_DEBUG("write return %d\n", n);
     if (n > 0) {
         connBuf->bufp += n;
         connBuf->expectedBytes -= n;
         if (connBuf->expectedBytes == 0) {
             if (conn->expectedEvents & EPOLLOUT) {
+                FPRINTF_DEBUG("write done, watch EPOLLIN\n");
                 conn->expectedEvents = EPOLLIN;
                 conn->callback       = NULL;
                 struct epoll_event ev;
@@ -243,6 +256,7 @@ void writeN(struct conn *conn)
     return;
 
 epollout:
+    FPRINTF_DEBUG(HIGHLIGHT_START "write not complete, wait EPOLLOUT" HIGHLIGHT_END "\n");
     if (conn->expectedEvents & EPOLLOUT) {
         return;
     }
@@ -312,7 +326,7 @@ void proxyToClient(struct conn *remoteConn);
 
 void proxyToRemoteTargetDone(struct conn *remoteConn)
 {
-    FPRINTF_DEBUG("proxy to remote target done\n");
+    FPRINTF_DEBUG("client send data to remote done\n");
 
     // client
     remoteConn->assocConn->blocked    = 0;
@@ -325,11 +339,14 @@ void proxyToRemoteTargetDone(struct conn *remoteConn)
 
 void proxyToRemoteTarget(struct conn *clientConn)
 {
-    FPRINTF_DEBUG("proxy to remote target\n");
+    FPRINTF_DEBUG("client send data to remote, data length: ");
 
     if (clientConn->buf->bufUsed == 0) {
+        FPRINTF_DEBUG("0\n");
         return;
     }
+
+    FPRINTF_DEBUG("%d\n", clientConn->buf->bufUsed);
 
     clientConn->blocked = 1; // ignore clientConn events
     struct conn *remoteConn = clientConn->assocConn;
@@ -342,7 +359,7 @@ void proxyToRemoteTarget(struct conn *clientConn)
 
 void proxyToClientDone(struct conn *clientConn)
 {
-    FPRINTF_DEBUG("proxy to client done\n");
+    FPRINTF_DEBUG("remote send data to client done\n");
 
     // remote
     clientConn->assocConn->blocked    = 0;
@@ -355,11 +372,14 @@ void proxyToClientDone(struct conn *clientConn)
 
 void proxyToClient(struct conn *remoteConn)
 {
-    FPRINTF_DEBUG("proxy to client\n");
+    FPRINTF_DEBUG("remote send data to client, data length: ");
 
     if (remoteConn->buf->bufUsed == 0) {
+        FPRINTF_DEBUG("0\n");
         return;
     }
+
+    FPRINTF_DEBUG("%d\n", remoteConn->buf->bufUsed);
 
     remoteConn->blocked = 1; // ignore remoteConn events
     struct conn *clientConn = remoteConn->assocConn;
@@ -395,8 +415,6 @@ void startProxy(struct conn *clientConn)
 
 void confirmConnectedToRemoteTarget(struct conn *remoteConn)
 {
-    FPRINTF_DEBUG("confirm connected to remote target\n");
-
     int optval = 0;
     socklen_t optlen = sizeof(optval);
     int ret = getsockopt(remoteConn->fd, SOL_SOCKET, SO_ERROR, &optval, &optlen);
@@ -425,6 +443,9 @@ void confirmConnectedToRemoteTarget(struct conn *remoteConn)
         exit(1);
     }
 
+    FPRINTF_DEBUG(HIGHLIGHT_START "connected to remote target success" HIGHLIGHT_END "\n");
+    FPRINTF_DEBUG("response client\n");
+
     struct conn *clientConn = remoteConn->assocConn;
     uint8_t *buf = clientConn->buf->buf;
     buf[1] = CMD_REPLY_SUCCESS;
@@ -445,13 +466,11 @@ error:
 
 void processCommandConnect(struct conn *conn)
 {
-    FPRINTF_DEBUG("process command connect\n");
-
 #ifdef DEBUG
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, conn->buf->buf + 4, ip, INET_ADDRSTRLEN);
     uint16_t port = *((uint16_t *)(conn->buf->buf + 4 + 4));
-    FPRINTF_DEBUG("connect to %s:%d\n", ip, ntohs(port));
+    FPRINTF_DEBUG(HIGHLIGHT_START "try to connect %s:%d" HIGHLIGHT_END "\n", ip, ntohs(port));
 #endif
 
     struct sockaddr_in addr;
@@ -482,6 +501,11 @@ void processCommandConnect(struct conn *conn)
     remoteConn->fd             = remotefd;
     remoteConn->expectedEvents = EPOLLOUT;
     remoteConn->callback       = confirmConnectedToRemoteTarget;
+    remoteConn->buf            = conn->buf;
+#ifdef DEBUG
+    inet_ntop(AF_INET, &addr.sin_addr, remoteConn->ip, INET_ADDRSTRLEN);
+    remoteConn->port = ntohs(addr.sin_port);
+#endif
 
     struct epoll_event ev;
     ev.events   = EPOLLOUT;
@@ -521,7 +545,7 @@ void dispatchCommand(struct conn *conn)
 
 void processCommandCalcLen(struct conn *conn)
 {
-    FPRINTF_DEBUG("process command calc len\n");
+    FPRINTF_DEBUG("got client command\n");
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
     if (buf[0] != SOCKS5_VER) {
@@ -545,6 +569,8 @@ void processCommandCalcLen(struct conn *conn)
         dstAddrLen = CONN_BUF_LEN - 2;
     }
 
+    FPRINTF_DEBUG("prepare to read command arguments\n");
+
     conn->buf->expectedBytes = dstAddrLen + 2;
     conn->nextCallback = dispatchCommand;
     return;
@@ -556,7 +582,7 @@ badFormat:
 
 void startProcessCommand(struct conn *conn)
 {
-    FPRINTF_DEBUG("start process command\n");
+    FPRINTF_DEBUG("wait for client command\n");
 
     conn->callback     = readN;
     conn->nextCallback = processCommandCalcLen;
@@ -573,7 +599,7 @@ void startProcessCommand(struct conn *conn)
 */
 void doAuth(struct conn *conn)
 {
-    FPRINTF_DEBUG("do auth\n");
+    FPRINTF_DEBUG("got username/password, check it\n");
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
     uint8_t ulen = buf[1];
@@ -593,6 +619,9 @@ void doAuth(struct conn *conn)
         FPRINTF_DEBUG("auth failed\n");
     }
 
+    FPRINTF_DEBUG(HIGHLIGHT_START "username/password OK" HIGHLIGHT_END "\n");
+    FPRINTF_DEBUG("response client\n");
+
     conn->buf->expectedBytes = 2;
     conn->buf->bufp = buf;
     conn->callback     = NULL;
@@ -602,7 +631,7 @@ void doAuth(struct conn *conn)
 
 void authPasswordCalcLen(struct conn *conn)
 {
-    FPRINTF_DEBUG("auth password calc len\n");
+    FPRINTF_DEBUG("prepare to read password\n");
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
     uint8_t plen = buf[2 + buf[1]];
@@ -619,7 +648,7 @@ void authPasswordCalcLen(struct conn *conn)
 
 void authUsernameCalcLen(struct conn *conn)
 {
-    FPRINTF_DEBUG("auth username calc len\n");
+    FPRINTF_DEBUG("prepare to read username\n");
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
 
@@ -635,7 +664,7 @@ void authUsernameCalcLen(struct conn *conn)
 
 void startAuth(struct conn *conn)
 {
-    FPRINTF_DEBUG("start auth\n");
+    FPRINTF_DEBUG("wait for client username/password message\n");
 
     conn->callback     = readN;
     conn->nextCallback = authUsernameCalcLen;
@@ -645,7 +674,7 @@ void startAuth(struct conn *conn)
 
 void selectAuthMethod(struct conn *conn)
 {
-    FPRINTF_DEBUG("select auth method\n");
+    FPRINTF_DEBUG("got client auth methods\n");
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
 
@@ -664,6 +693,9 @@ void selectAuthMethod(struct conn *conn)
     }
 #endif
 
+    FPRINTF_DEBUG("client support username/password authentication, good.\n");
+    FPRINTF_DEBUG("response client\n");
+
     buf[1] = method;
     conn->buf->expectedBytes = 2;
     conn->buf->bufp = buf;
@@ -681,7 +713,7 @@ void selectAuthMethod(struct conn *conn)
 */
 void selectAuthMethodCalcLen(struct conn *conn)
 {
-    FPRINTF_DEBUG("select auth method calc len\n");
+    FPRINTF_DEBUG("prepare to read auth methods\n");
 
     uint8_t *buf = (uint8_t *)conn->buf->buf;
     if (buf[0] != SOCKS5_VER || buf[1] == 0) {
@@ -696,7 +728,7 @@ void selectAuthMethodCalcLen(struct conn *conn)
 
 void acceptClient(struct conn *listeningConn)
 {
-    FPRINTF_DEBUG("accept client\n");
+    FPRINTF_DEBUG(HIGHLIGHT_START "accept client" HIGHLIGHT_END "\n");
 
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
@@ -706,12 +738,6 @@ void acceptClient(struct conn *listeningConn)
         FPRINTF("accept4 error: %s", strerror(errno));
         return;
     }
-
-#ifdef DEBUG
-    char ip[INET_ADDRSTRLEN]; // ddd.ddd.ddd.ddd
-    inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
-    FPRINTF_DEBUG("accept4 %s:%d\n", ip, ntohs(addr.sin_port));
-#endif
 
     struct conn *conn = getAFreeClientConn();
     if (conn == NULL) {
@@ -726,6 +752,12 @@ void acceptClient(struct conn *listeningConn)
         FPRINTF("setsockopt keepalive error: %s\n", strerror(errno));
         return;
     }
+
+#ifdef DEBUG
+    inet_ntop(AF_INET, &addr.sin_addr, conn->ip, INET_ADDRSTRLEN);
+    conn->port = ntohs(addr.sin_port);
+    FPRINTF_DEBUG(HIGHLIGHT_START "accept %s:%d" HIGHLIGHT_END "\n", conn->ip, conn->port);
+#endif
 
     conn->fd             = cfd;
     conn->expectedEvents = EPOLLIN;
@@ -779,6 +811,30 @@ void start(int sfd)
         FPRINTF_DEBUG("epoll_wait return %d\n", ready);
         for (i = 0; i < ready; i++) {
             conn = (struct conn *)(evList[i].data.ptr);
+#ifdef DEBUG
+    if (conn->fd != sfd) {
+        FPRINTF_DEBUG(HIGHLIGHT_START);
+        if (conn->assocConn) {
+            FPRINTF_DEBUG("%s:%d <--> %s:%d expects", conn->ip, conn->port, conn->assocConn->ip, conn->assocConn->port);
+        } else {
+            FPRINTF_DEBUG("%s:%d expects", conn->ip, conn->port);
+        }
+        if (conn->expectedEvents & EPOLLIN) {
+            FPRINTF_DEBUG(" EPOLLIN");
+        }
+        if (conn->expectedEvents & EPOLLOUT) {
+            FPRINTF_DEBUG(" EPOLLOUT");
+        }
+        FPRINTF_DEBUG(", now it got");
+        if (evList[i].events & EPOLLIN) {
+            FPRINTF_DEBUG(" EPOLLIN");
+        }
+        if (evList[i].events & EPOLLOUT) {
+            FPRINTF_DEBUG(" EPOLLOUT");
+        }
+        FPRINTF_DEBUG(HIGHLIGHT_END "\n");
+    }
+#endif
             if (conn->expectedEvents & evList[i].events) {
                 if (!conn->blocked) {
                     conn->callback(conn);
@@ -786,6 +842,7 @@ void start(int sfd)
             } else if (conn->fd == sfd) {
                 FPRINTF("listening socket: unexpected events\n");
             } else {
+                FPRINTF("unexpected events\n");
                 if (conn->assocConn) {
                     closeConn(conn->assocConn);
                 }
