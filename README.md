@@ -71,4 +71,4 @@
 
 # Run firefox
 
-    MY_SOCKS5_USERNAME=user MY_SOCKS5_PASSWORD=pass ./firefox
+    env MY_SOCKS5_USERNAME=user MY_SOCKS5_PASSWORD=pass /home/heguangyu5/firefox/firefox
