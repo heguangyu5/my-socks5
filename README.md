@@ -71,5 +71,5 @@
 # Run firefox
 
     # select "Proxy DNS when using SOCKS v5"
-    # ssh -L 127.0.0.1:5555:127.0.0.1:5555 user@remote
+    # ssh -L 127.0.0.1:1080:127.0.0.1:1080 user@remote
     env MY_SOCKS5_USERNAME=user MY_SOCKS5_PASSWORD=pass /home/heguangyu5/firefox/firefox
