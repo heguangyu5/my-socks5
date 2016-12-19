@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netdb.h>
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 
@@ -44,8 +45,8 @@ struct conn {
     struct connBuf  *buf;
     uint8_t         blocked;
 #ifdef DEBUG
-    char            ip[INET_ADDRSTRLEN];
-    uint16_t        port;
+    char ip[NI_MAXHOST];
+    char port[NI_MAXSERV];
 #endif
 };
 
@@ -87,7 +88,7 @@ void help()
         "usage: ./my-socks5 -u username -p password [-P port] [-F] [-h]\n"
         "       -u  username, required\n"
         "       -p  password, required\n"
-        "       -P  port, default 1080, should > 1024\n"
+        "       -P  port, default 5555\n"
         "       -F  run in foreground\n"
         "       -h  usage info\n"
     );
@@ -427,7 +428,7 @@ void confirmConnectedToRemoteTarget(struct conn *remoteConn)
         goto error;
     }
     // optval = 0, connect success
-    struct sockaddr_in addr;
+    struct sockaddr addr;
     socklen_t addrlen = sizeof(addr);
     if (getsockname(remoteConn->fd, (struct sockaddr *)&addr, &addrlen) == -1) {
         FPRINTF("getsockname error: %s\n", strerror(errno));
@@ -449,10 +450,20 @@ void confirmConnectedToRemoteTarget(struct conn *remoteConn)
     struct conn *clientConn = remoteConn->assocConn;
     uint8_t *buf = clientConn->buf->buf;
     buf[1] = CMD_REPLY_SUCCESS;
-    memcpy(buf + 4, &addr.sin_addr.s_addr, 4);
-    memcpy(buf + 8, &addr.sin_port, 2);
+    if (addr.sa_family == AF_INET) {
+        buf[3] = ADDR_TYPE_IPV4;
+        struct sockaddr_in *addr_in = (struct sockaddr_in *)&addr;
+        memcpy(buf + 4, &addr_in->sin_addr.s_addr, 4);
+        memcpy(buf + 8, &addr_in->sin_port, 2);
+        clientConn->buf->expectedBytes = 10; // 4 + 4 + 2
+    } else {
+        buf[3] = ADDR_TYPE_IPV6;
+        struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *)&addr;
+        memcpy(buf + 4, &addr_in6->sin6_addr.s6_addr, 16);
+        memcpy(buf + 20, &addr_in6->sin6_port, 2);
+        clientConn->buf->expectedBytes = 22; // 4 + 16 + 2
+    }
 
-    clientConn->buf->expectedBytes = 10; // 4 + 4 + 2
     clientConn->buf->bufp = clientConn->buf->buf;
     clientConn->callback     = NULL;
     clientConn->nextCallback = startProxy;
@@ -466,46 +477,86 @@ error:
 
 void processCommandConnect(struct conn *conn)
 {
+    char hbuf[NI_MAXHOST];
+    char sbuf[NI_MAXSERV];
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    int err;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_NUMERICSERV;
+
+    int addrType = conn->buf->buf[3];
+    uint8_t domainNameLen;
+    switch (addrType) {
+    case ADDR_TYPE_IPV4:
+        inet_ntop(AF_INET, conn->buf->buf + 4, hbuf, NI_MAXHOST);
+        sprintf(sbuf, "%d", ntohs(*((uint16_t *)(conn->buf->buf + 4 + 4))));
+        hints.ai_family = AF_INET;
+        hints.ai_flags |= AI_NUMERICHOST;
+        break;
+    case ADDR_TYPE_DOMAINNAME:
+        domainNameLen = *((uint8_t *)(conn->buf->buf + 4));
+        memcpy(hbuf, conn->buf->buf + 4 + 1, domainNameLen);
+        hbuf[domainNameLen] = 0;
+        sprintf(sbuf, "%d", ntohs(*((uint16_t *)(conn->buf->buf + 4 + 1 + domainNameLen))));
+        hints.ai_family = AF_UNSPEC;
+        break;
+    case ADDR_TYPE_IPV6:
+        inet_ntop(AF_INET6, conn->buf->buf + 4, hbuf, NI_MAXHOST);
+        sprintf(sbuf, "%d", ntohs(*((uint16_t *)(conn->buf->buf + 4 + 16))));
+        hints.ai_family = AF_INET6;
+        hints.ai_flags |= AI_NUMERICHOST;
+        break;
+    }
+
 #ifdef DEBUG
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, conn->buf->buf + 4, ip, INET_ADDRSTRLEN);
-    uint16_t port = *((uint16_t *)(conn->buf->buf + 4 + 4));
-    FPRINTF_DEBUG(HIGHLIGHT_START "try to connect %s:%d" HIGHLIGHT_END "\n", ip, ntohs(port));
+    FPRINTF_DEBUG(HIGHLIGHT_START "clinet want to connect %s:%s" HIGHLIGHT_END "\n", hbuf, sbuf);
 #endif
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = *((uint16_t *)(conn->buf->buf + 4 + 4));
-    addr.sin_addr.s_addr = *((uint32_t *)(conn->buf->buf + 4));
-
-    int remotefd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (remotefd == -1) {
-        FPRINTF("create remote socket error: %s\n", strerror(errno));
+    err = getaddrinfo(hbuf, sbuf, &hints, &result);
+    if (err != 0) {
+        FPRINTF("getaddrinfo error: %s\n", gai_strerror(err));
         cmdReplyError(conn, CMD_REPLY_GENERRAL_SOCKS_ERROR);
         return;
     }
 
-    if (connect(remotefd, (struct sockaddr *)&addr, sizeof(addr)) != -1) {
-        FPRINTF("!!!connect to remote target immediately!!!\n");
+    int remotefd;
+    struct conn *remoteConn = getAFreeRemoteConn();
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        remotefd = socket(rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK, rp->ai_protocol);
+        if (remotefd == -1) {
+            continue;
+        }
+        if (connect(remotefd, rp->ai_addr, rp->ai_addrlen) != -1) {
+            FPRINTF("!!!connect to remote target immediately!!!\n");
+            exit(1);
+        }
+        if (errno == EINPROGRESS) {
+#ifdef DEBUG
+    err = getnameinfo(rp->ai_addr, rp->ai_addrlen, remoteConn->ip, NI_MAXHOST, remoteConn->port, NI_MAXSERV, NI_NUMERICHOST | NI_NUMERICSERV);
+    if (err != 0) {
+        FPRINTF("getnamedinfo error: %s\n", gai_strerror(err));
         exit(1);
     }
-
-    if (errno != EINPROGRESS) {
-        FPRINTF("connect error: %s\n", strerror(errno));
+    FPRINTF_DEBUG(HIGHLIGHT_START "actually connect %s:%s" HIGHLIGHT_END "\n", remoteConn->ip, remoteConn->port);
+#endif
+            break;
+        }
+        close(remotefd);
+    }
+    freeaddrinfo(result);
+    if (rp == NULL) {
+        FPRINTF("connect failed\n");
         cmdReplyError(conn, CMD_REPLY_GENERRAL_SOCKS_ERROR);
         return;
     }
 
-    struct conn *remoteConn = getAFreeRemoteConn();
     remoteConn->fd             = remotefd;
     remoteConn->expectedEvents = EPOLLOUT;
     remoteConn->callback       = confirmConnectedToRemoteTarget;
     remoteConn->buf            = conn->buf;
-#ifdef DEBUG
-    inet_ntop(AF_INET, &addr.sin_addr, remoteConn->ip, INET_ADDRSTRLEN);
-    remoteConn->port = ntohs(addr.sin_port);
-#endif
 
     struct epoll_event ev;
     ev.events   = EPOLLOUT;
@@ -730,7 +781,7 @@ void acceptClient(struct conn *listeningConn)
 {
     FPRINTF_DEBUG(HIGHLIGHT_START "accept client" HIGHLIGHT_END "\n");
 
-    struct sockaddr_in addr;
+    struct sockaddr addr;
     socklen_t addrlen = sizeof(addr);
 
     int cfd = accept4(listeningConn->fd, &addr, &addrlen, SOCK_NONBLOCK);
@@ -754,9 +805,13 @@ void acceptClient(struct conn *listeningConn)
     }
 
 #ifdef DEBUG
-    inet_ntop(AF_INET, &addr.sin_addr, conn->ip, INET_ADDRSTRLEN);
-    conn->port = ntohs(addr.sin_port);
-    FPRINTF_DEBUG(HIGHLIGHT_START "accept %s:%d" HIGHLIGHT_END "\n", conn->ip, conn->port);
+    int err = getnameinfo(&addr, addrlen, conn->ip, NI_MAXHOST, conn->port, NI_MAXSERV, NI_NUMERICHOST | NI_NUMERICSERV);
+    if (err != 0) {
+        close(cfd);
+        FPRINTF("getnamedinfo error: %s\n", gai_strerror(err));
+        return;
+    }
+    FPRINTF_DEBUG(HIGHLIGHT_START "accept %s:%s" HIGHLIGHT_END "\n", conn->ip, conn->port);
 #endif
 
     conn->fd             = cfd;
@@ -815,9 +870,9 @@ void start(int sfd)
     if (conn->fd != sfd) {
         FPRINTF_DEBUG(HIGHLIGHT_START);
         if (conn->assocConn) {
-            FPRINTF_DEBUG("%s:%d <--> %s:%d expects", conn->ip, conn->port, conn->assocConn->ip, conn->assocConn->port);
+            FPRINTF_DEBUG("%s:%s <--> %s:%s expects", conn->ip, conn->port, conn->assocConn->ip, conn->assocConn->port);
         } else {
-            FPRINTF_DEBUG("%s:%d expects", conn->ip, conn->port);
+            FPRINTF_DEBUG("%s:%s expects", conn->ip, conn->port);
         }
         if (conn->expectedEvents & EPOLLIN) {
             FPRINTF_DEBUG(" EPOLLIN");
@@ -835,6 +890,10 @@ void start(int sfd)
         FPRINTF_DEBUG(HIGHLIGHT_END "\n");
     }
 #endif
+            if (conn->fd == -1) {
+                FPRINTF_DEBUG("conn closed, skip this conn\n");
+                continue;
+            }
             if (conn->expectedEvents & evList[i].events) {
                 if (!conn->blocked) {
                     conn->callback(conn);
@@ -855,7 +914,7 @@ void start(int sfd)
 int main(int argc, char **argv)
 {
     char c;
-    int port = 1080;
+    char *port = "5555";
     int daemonize = 1;
 
     // options
@@ -885,11 +944,7 @@ int main(int argc, char **argv)
                 }
                 break;
             case 'P':
-                port = atoi(optarg);
-                if (port <= 1024 || port > 65535) {
-                    printf("port should > 1024 and <= 65535\n");
-                    exit(1);
-                }
+                port = optarg;
                 break;
             case 'F':
                 daemonize = 0;
@@ -903,27 +958,40 @@ int main(int argc, char **argv)
         help();
         exit(1);
     }
-    // socket listening
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd == -1) {
-        perror("socket");
+    // socket bind
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    int err, sfd;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE | AI_NUMERICSERV;
+    err = getaddrinfo(NULL, port, &hints, &result);
+    if (err != 0) {
+        printf("getaddrinfo error: %s\n", gai_strerror(err));
         exit(1);
     }
-    int optval = 1;
-    if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
-        perror("setsockopt");
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sfd == -1) {
+            continue;
+        }
+        int optval = 1;
+        if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+            perror("setsockopt");
+            exit(1);
+        }
+        if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
+        }
+        close(sfd);
+    }
+    if (rp == NULL) {
+        printf("cannot bind\n");
         exit(1);
     }
-    if (bind(sfd, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-        perror("bind");
-        exit(1);
-    }
+    freeaddrinfo(result);
+    // listen
     if (listen(sfd, 512) == -1) {
         perror("listen");
         exit(1);
@@ -952,7 +1020,7 @@ int main(int argc, char **argv)
         logFile = stdout;
     }
     // start
-    FPRINTF("start, port = %d, pid = %d\n", port, getpid());
+    FPRINTF("start, port = %s, pid = %d\n", port, getpid());
     FPRINTF("username: %s\n", username);
     FPRINTF("password: %s\n", password);
     start(sfd);

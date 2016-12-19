@@ -4,13 +4,12 @@
     usage: ./my-socks5 -u username -p password [-P port] [-F] [-h]
            -u  username, required
            -p  password, required
-           -P  port, default 1080, should > 1024
+           -P  default 5555
            -F  run in foreground
            -h  usage info
 
 - currently only support TCP
 - currently only support Username/Password AUTH
-- currently only support IPV4
 - currently it is Half Duplex
 
 # Build Firefox from source to support SOCKS5 Username/Password Authentication
@@ -71,4 +70,5 @@
 
 # Run firefox
 
+    # select "Proxy DNS when using SOCKS v5"
     env MY_SOCKS5_USERNAME=user MY_SOCKS5_PASSWORD=pass /home/heguangyu5/firefox/firefox
