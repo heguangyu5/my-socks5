@@ -363,7 +363,7 @@ void proxyToClientDone(struct conn *clientConn)
     FPRINTF_DEBUG("remote send data to client done\n");
 
     // remote
-    clientConn->assocConn->blocked    = 0;
+    clientConn->assocConn->blocked = 0;
     // client
     clientConn->callback     = readN;
     clientConn->nextCallback = proxyToRemoteTarget;
@@ -556,6 +556,7 @@ void processCommandConnect(struct conn *conn)
     remoteConn->fd             = remotefd;
     remoteConn->expectedEvents = EPOLLOUT;
     remoteConn->callback       = confirmConnectedToRemoteTarget;
+    remoteConn->blocked        = 0;
     remoteConn->buf            = conn->buf;
 
     struct epoll_event ev;
@@ -819,6 +820,7 @@ void acceptClient(struct conn *listeningConn)
     conn->callback       = readN;
     conn->nextCallback   = selectAuthMethodCalcLen;
     conn->assocConn      = NULL;
+    conn->blocked        = 0;
     resetConnBuf(conn->buf);
     conn->buf->expectedBytes = 2;
 
