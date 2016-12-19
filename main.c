@@ -63,6 +63,7 @@ struct conn {
 #define ADDR_TYPE_DOMAINNAME 3
 #define ADDR_TYPE_IPV6       4
 
+#define AUTH_METHOD_NONE      0
 #define AUTH_METHOD_USER_PASS 2
 #define AUTH_METHOD_USER_PASS_VER 1
 #define AUTH_METHOD_USER_PASS_SUCCESS 0
@@ -85,7 +86,7 @@ uint8_t     passwordLen;
 void help()
 {
     printf(
-        "usage: ./my-socks5 -u username -p password [-P port] [-F] [-h]\n"
+        "usage: ./my-socks5 [-u username] [-p password] [-P port] [-F] [-h]\n"
         "       -u  username, required\n"
         "       -p  password, required\n"
         "       -P  port, default 5555\n"
@@ -732,11 +733,28 @@ void selectAuthMethod(struct conn *conn)
 
     int i;
     uint8_t method = 0xFF;
-    for (i = 0; i < buf[1]; i++) {
-        if (buf[i + 2] == AUTH_METHOD_USER_PASS) {
-            method = AUTH_METHOD_USER_PASS;
-            break;
+    void (*nextCallback)(struct conn *);
+    if (username && password) {
+        for (i = 0; i < buf[1]; i++) {
+            if (buf[i + 2] == AUTH_METHOD_USER_PASS) {
+                FPRINTF_DEBUG("client support username/password authentication, good.\n");
+                method = AUTH_METHOD_USER_PASS;
+                nextCallback = startAuth;
+                break;
+            }
         }
+    } else {
+        for (i = 0; i < buf[1]; i++) {
+            if (buf[i + 2] == AUTH_METHOD_NONE) {
+                FPRINTF_DEBUG("client expects no authentication required, ok, continue\n");
+                method = AUTH_METHOD_NONE;
+                nextCallback = startProcessCommand;
+                break;
+            }
+        }
+    }
+    if (method == 0xFF) {
+        nextCallback = delayCloseConn;
     }
 
 #ifdef DEBUG
@@ -745,14 +763,13 @@ void selectAuthMethod(struct conn *conn)
     }
 #endif
 
-    FPRINTF_DEBUG("client support username/password authentication, good.\n");
     FPRINTF_DEBUG("response client\n");
 
     buf[1] = method;
     conn->buf->expectedBytes = 2;
     conn->buf->bufp = buf;
     conn->callback     = NULL;
-    conn->nextCallback = method == 0xFF ? delayCloseConn : startAuth;
+    conn->nextCallback = nextCallback;
     writeN(conn);
 }
 
@@ -916,7 +933,7 @@ void start(int sfd)
 int main(int argc, char **argv)
 {
     char c;
-    char *port = "5555";
+    char *port = "1080";
     int daemonize = 1;
 
     // options
@@ -955,10 +972,6 @@ int main(int argc, char **argv)
                 help();
                 exit(1);
         }
-    }
-    if (username == NULL || password == NULL) {
-        help();
-        exit(1);
     }
     // socket bind
     struct addrinfo hints;

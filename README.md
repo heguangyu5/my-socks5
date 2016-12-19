@@ -1,10 +1,10 @@
 # socks5 proxy
 
     ./my-socks5 -h
-    usage: ./my-socks5 -u username -p password [-P port] [-F] [-h]
+    usage: ./my-socks5 [-u username] [-p password] [-P port] [-F] [-h]
            -u  username, required
            -p  password, required
-           -P  default 5555
+           -P  default 1080
            -F  run in foreground
            -h  usage info
 
