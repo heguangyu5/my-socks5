@@ -664,13 +664,13 @@ void doAuth(struct conn *conn)
     ) {
         buf[1] = AUTH_METHOD_USER_PASS_SUCCESS;
         nextCallback = startProcessCommand;
+        FPRINTF_DEBUG(HIGHLIGHT_START "username/password OK" HIGHLIGHT_END "\n");
     } else {
         buf[1] = AUTH_METHOD_USER_PASS_FAILED;
         nextCallback = delayCloseConn;
-        FPRINTF_DEBUG("auth failed\n");
+        FPRINTF_DEBUG(HIGHLIGHT_START "auth failed" HIGHLIGHT_END "\n");
     }
 
-    FPRINTF_DEBUG(HIGHLIGHT_START "username/password OK" HIGHLIGHT_END "\n");
     FPRINTF_DEBUG("response client\n");
 
     conn->buf->expectedBytes = 2;
